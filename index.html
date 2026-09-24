@@ -81,11 +81,24 @@
     color: #b6c2d2; white-space: pre-wrap; word-break: break-word;
   }
   details.diag .meta { font-size: 0.75rem; color: #8b95a5; margin-top: 0.6rem; line-height: 1.6; }
-  footer { margin-top: 2.2rem; font-size: 0.72rem; color: #64748b; line-height: 1.6; }
+  .boot {
+    background: #3a1d1d; border: 1px solid #a1412f; border-radius: 12px;
+    padding: 0.85rem 1rem; margin-bottom: 1.2rem; font-size: 0.82rem;
+    line-height: 1.5; color: #ffd9d1; display: flex; flex-direction: column; gap: 0.35rem;
+  }
+  .boot[hidden] { display: none; }
+  .boot .hint { color: #e8b3a7; font-size: 0.76rem; }
+  footer { margin-top: 2.2rem; font-size: 0.72rem; color: #64748b; line-height: 1.6; } font-size: 0.72rem; color: #64748b; line-height: 1.6; }
 </style>
 </head>
 <body>
 <div class="wrap">
+  <div class="boot" id="bootError" hidden>
+    <strong>&#9888;&#65039; Algo fall&oacute; al iniciar la herramienta</strong>
+    <span class="msg"></span>
+    <span class="hint">Recarga con Ctrl+F5 (Cmd+Shift+R en Mac) para descartar la versi&oacute;n guardada en cach&eacute;. Si sigue igual, m&aacute;ndame una foto de este aviso.</span>
+  </div>
+
   <a class="back" href="/">&larr; Volver a Mis Herramientas Fiscales</a>
   <h1>Extractor de estado de cuenta</h1>
   <p class="sub">
@@ -152,29 +165,51 @@
   </footer>
 </div>
 
+<script>
+  /* Vigilante de arranque: si algo falla al iniciar, avisa en pantalla en vez
+     de dejar la pagina muda. */
+  (function () {
+    function show(msg) {
+      var el = document.getElementById("bootError");
+      if (!el) return;
+      el.hidden = false;
+      var m = el.querySelector(".msg");
+      if (m && m.textContent !== msg) m.textContent = msg;
+    }
+    window.__fiscalFallo = show;
+    window.addEventListener("error", function (e) {
+      if (e && e.target && e.target.tagName === "SCRIPT") {
+        show("No se pudo cargar una libreria externa (se necesita internet). Revisa tu conexion y recarga la pagina.");
+      }
+    }, true);
+    window.addEventListener("unhandledrejection", function () {
+      show("Ocurrio un error inesperado al iniciar la herramienta. Recarga la pagina.");
+    });
+    setTimeout(function () {
+      if (!window.__fiscalOk) {
+        show("La herramienta no termino de iniciar. Lo mas comun es que la pagina no se haya descargado completa desde el sitio, o que el navegador haya bloqueado los scripts.");
+      }
+    }, 3000);
+  })();
+</script>
 <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
 <script type="module">
-/* =========================================================================
-   Extractor de estado de cuenta  ·  v2
-   Sin red: no se hace ni una sola petición HTTP. Todo se calcula en memoria.
-   El motor no depende de espacios ni tabuladores: trabaja con la posición
-   real (x) de cada fragmento de texto del PDF, por lo que sirve para
-   cualquier banco.
-   ========================================================================= */
-
-const OUT_HEADERS = ["fecha", "descripcion", "cargo", "abono", "numero_poliza"];
-const PDFJS_VER = "4.10.38";
-const MXN = new Intl.NumberFormat("es-MX", { style: "currency", currency: "MXN" });
-
-let pdfjs = null;
-async function loadPdfJs() {
-  if (pdfjs) return pdfjs;
-  const mod = await import(`https://cdn.jsdelivr.net/npm/pdfjs-dist@${PDFJS_VER}/build/pdf.min.mjs`);
-  mod.GlobalWorkerOptions.workerSrc =
-    `https://cdn.jsdelivr.net/npm/pdfjs-dist@${PDFJS_VER}/build/pdf.worker.min.mjs`;
-  pdfjs = mod;
-  return mod;
+if (typeof XLSX === "undefined") {
+  window.__fiscalFallo("No se pudo cargar la libreria de Excel. Sin ella no se leen archivos .xlsx, .xls ni .csv. Revisa tu conexion a internet y recarga.");
 }
+
+/* ==== MOTOR:INICIO ==== */
+/* ============================================================
+   motor-fiscal.js
+   Motor compartido de "Mis Herramientas Fiscales".
+   - Lectura de estados de cuenta y analiticas: Excel, CSV y PDF,
+     de cualquier banco (no depende de espacios ni de un formato fijo).
+   - Limpieza de datos sensibles (CLABE, tarjeta, RFC, CURP, correo,
+     telefono, cuentas y referencias largas).
+   - Conciliacion bancaria contra libros.
+   Todo es determinista y corre en el navegador: ningun archivo sale
+   del equipo del usuario. No hace peticiones de red.
+   ============================================================ */
 
 /* ==== PURE:START ==== */
 /* Núcleo puro: no toca el DOM ni la red. Se prueba automáticamente. */
@@ -810,12 +845,13 @@ function extractRowsFromLines(lines, ctx) {
     bySaldo,
   };
 }
-/* ==== PURE:END ==== */
 
-/* ------------------------- lectores (navegador) ------------------------- */
 
-async function pdfToPages(file) {
-  const lib = await loadPdfJs();
+/* ============================================================
+   LECTOR DE PDF (a partir de una librería pdf.js ya cargada)
+   ============================================================ */
+
+async function readPdfPages(lib, file) {
   const data = new Uint8Array(await file.arrayBuffer());
   const doc = await lib.getDocument({ data }).promise;
   const pages = [];
@@ -827,6 +863,222 @@ async function pdfToPages(file) {
     })));
   }
   return pages;
+}
+
+/* Encadena todo el análisis de un PDF: páginas -> renglones -> columnas -> movimientos. */
+function analyzePdfItems(pages, opts) {
+  const o = opts || {};
+  const lines = pages.flatMap((items) => groupIntoLines(normalizeItems(items)));
+  const header = findHeaderCols(lines);
+  const cols = buildColumns(lines, header, explodeItem);
+  const res = extractRowsFromLines(lines, {
+    header, cols, invert: !!o.invert, year: o.year || new Date().getFullYear(), explode: explodeItem,
+  });
+  return {
+    lines, header, cols,
+    rows: res.rows, omitted: res.omitted, ambiguous: res.ambiguous, bySaldo: res.bySaldo,
+  };
+}
+
+/* ============================================================
+   CONCILIACIÓN BANCARIA
+   Compara dos listas de movimientos (banco contra libros) por
+   importe absoluto y cercanía de fecha. Todo determinista.
+   ============================================================ */
+
+const DAY_MS = 86400000;
+
+function dayDiff(a, b) {
+  if (!a || !b) return null;
+  const da = Date.parse(`${a}T12:00:00Z`);
+  const db = Date.parse(`${b}T12:00:00Z`);
+  if (!Number.isFinite(da) || !Number.isFinite(db)) return null;
+  return Math.round((da - db) / DAY_MS);
+}
+
+function movementOf(row, source) {
+  const cargo = Number(row && row.cargo) || 0;
+  const abono = Number(row && row.abono) || 0;
+  const monto = abono - cargo;                 // + abono (entrada), - cargo (salida)
+  return {
+    source: source || "",
+    fecha: (row && row.fecha) || null,
+    desc: (row && row.desc) || "",
+    cargo, abono, monto,
+    abs: Math.abs(monto),
+    poliza: (row && row.poliza) || "",
+  };
+}
+
+function buildPair(b, bd, dateTol) {
+  const dd = b && bd ? dayDiff(b.fecha, bd.fecha) : null;
+  let estado = "conciliado";
+  if (!b) estado = "solo-libros";
+  else if (!bd) estado = "solo-banco";
+  else if (dd == null || Math.abs(dd) > dateTol) estado = "posible";
+  return {
+    estado,
+    fechaBanco: b ? b.fecha : null,
+    descBanco: b ? b.desc : "",
+    cargoBanco: b ? b.cargo : 0,
+    abonoBanco: b ? b.abono : 0,
+    montoBanco: b ? b.monto : 0,
+    fechaLibros: bd ? bd.fecha : null,
+    descLibros: bd ? bd.desc : "",
+    cargoLibros: bd ? bd.cargo : 0,
+    abonoLibros: bd ? bd.abono : 0,
+    montoLibros: bd ? bd.monto : 0,
+    dias: dd,
+    difImporte: b && bd ? Math.round((b.abs - bd.abs) * 100) / 100 : 0,
+    signoEspejo: !!(b && bd && b.monto !== 0 && bd.monto !== 0 && Math.sign(b.monto) !== Math.sign(bd.monto)),
+    poliza: (bd && bd.poliza) || (b && b.poliza) || "",
+  };
+}
+
+/**
+ * Concilia banco contra libros.
+ * opts: { dateTolerance = 3, amountTolerance = 0.01, looseWindow = 45 }
+ * Pasadas: (1) fecha dentro de la tolerancia, (2) fecha lejana (partida en
+ * tránsito, hasta looseWindow días), (3) alguna fecha faltante -> solo importe.
+ * Lo que sobra queda como "solo-banco" o "solo-libros".
+ */
+function reconcile(bankRows, bookRows, opts) {
+  const o = opts || {};
+  const dateTol = o.dateTolerance == null ? 3 : o.dateTolerance;
+  const amtTol = o.amountTolerance == null ? 0.01 : o.amountTolerance;
+  const looseWindow = o.looseWindow == null ? 45 : o.looseWindow;
+  // En libros el movimiento esta "espejeado": un deposito es CARGO a la cuenta
+  // de bancos y un retiro es ABONO. Por eso, para comparar totales, el neto de
+  // libros se invierte. Con "mismo" se compara tal cual viene.
+  const signoL = o.signoLibros === "mismo" ? 1 : -1;
+
+  const bank = (bankRows || []).map((r) => movementOf(r, "banco"));
+  const books = (bookRows || []).map((r) => movementOf(r, "libros"));
+  const usedBank = new Array(bank.length).fill(false);
+  const usedBook = new Array(books.length).fill(false);
+
+  const index = new Map();
+  books.forEach((b, i) => {
+    if (!b.abs) return;
+    const k = Math.round(b.abs * 100);
+    const list = index.get(k);
+    if (list) list.push(i); else index.set(k, [i]);
+  });
+  const tolc = Math.max(0, Math.round(amtTol * 100));
+  const candidatesFor = (target) => {
+    if (!target) return [];
+    const k0 = Math.round(target * 100);
+    let out = [];
+    for (let k = k0 - tolc; k <= k0 + tolc; k++) {
+      const list = index.get(k);
+      if (list) out = out.concat(list);
+    }
+    return out;
+  };
+
+  const pairs = [];
+  const runPass = (maxDays, mode) => {
+    for (let i = 0; i < bank.length; i++) {
+      if (usedBank[i]) continue;
+      const b = bank[i];
+      if (!b.abs) continue;
+      let best = -1, bestCost = Infinity;
+      for (const j of candidatesFor(b.abs)) {
+        if (usedBook[j]) continue;
+        const bd = books[j];
+        const dd = dayDiff(b.fecha, bd.fecha);
+        if (mode === "nodate") { if (dd != null) continue; }
+        else if (dd == null || Math.abs(dd) > maxDays) continue;
+        const cost = (dd == null ? 999 : Math.abs(dd)) * 1000 + Math.abs(b.abs - bd.abs) * 100;
+        if (cost < bestCost) { bestCost = cost; best = j; }
+      }
+      if (best < 0) continue;
+      usedBank[i] = true;
+      usedBook[best] = true;
+      pairs.push(buildPair(b, books[best], dateTol));
+    }
+  };
+
+  runPass(dateTol, "strict");
+  runPass(looseWindow, "loose");
+  runPass(null, "nodate");
+
+  for (let i = 0; i < bank.length; i++) if (!usedBank[i]) pairs.push(buildPair(bank[i], null, dateTol));
+  for (let j = 0; j < books.length; j++) if (!usedBook[j]) pairs.push(buildPair(null, books[j], dateTol));
+
+  pairs.sort((a, b) => String(a.fechaBanco || a.fechaLibros || "").localeCompare(String(b.fechaBanco || b.fechaLibros || "")));
+
+  const sum = (list, key) => list.reduce((a, x) => a + (Number(x[key]) || 0), 0);
+  const pick = (e) => pairs.filter((p) => p.estado === e);
+  const conciliados = pick("conciliado");
+  const posibles = pick("posible");
+  const onlyBank = pick("solo-banco");
+  const onlyBooks = pick("solo-libros");
+
+  const round2 = (n) => Math.round(n * 100) / 100;
+  const netoBanco = round2(sum(bank, "monto"));
+  const netoLibros = round2(signoL * sum(books, "monto"));
+  const sinBanco = round2(sum(onlyBank, "montoBanco"));
+  const sinLibros = round2(signoL * sum(onlyBooks, "montoLibros"));
+  const diferencia = round2(netoBanco - netoLibros);
+  const explicada = round2(sinBanco - sinLibros);
+
+  return {
+    pairs,
+    summary: {
+      bancoN: bank.length, librosN: books.length,
+      bancoCargos: round2(sum(bank, "cargo")), bancoAbonos: round2(sum(bank, "abono")), bancoNeto: netoBanco,
+      librosCargos: round2(sum(books, "cargo")), librosAbonos: round2(sum(books, "abono")),
+      librosNeto: netoLibros, signoLibros: signoL === -1 ? "espejo" : "mismo",
+      conciliados: conciliados.length,
+      posibles: posibles.length,
+      soloBanco: onlyBank.length,
+      soloLibros: onlyBooks.length,
+      soloBancoMonto: sinBanco,
+      soloLibrosMonto: sinLibros,
+      diferencia, explicada,
+      cuadra: Math.abs(diferencia - explicada) < 0.01,
+      espejo: pairs.filter((p) => p.signoEspejo).length,
+      mismoSentido: conciliados.filter((p) => !p.signoEspejo).length,
+      sinFecha: pairs.filter((p) => (p.estado === "conciliado" || p.estado === "solo-banco") && !p.fechaBanco).length +
+                pairs.filter((p) => p.estado === "solo-libros" && !p.fechaLibros).length,
+    },
+  };
+}
+/* ==== MOTOR:FIN ==== */
+
+/* =========================================================================
+   Extractor de estado de cuenta  ·  v2
+   Sin red: no se hace ni una sola petición HTTP. Todo se calcula en memoria.
+   El motor no depende de espacios ni tabuladores: trabaja con la posición
+   real (x) de cada fragmento de texto del PDF, por lo que sirve para
+   cualquier banco.
+   ========================================================================= */
+
+const OUT_HEADERS = ["fecha", "descripcion", "cargo", "abono", "numero_poliza"];
+const PDFJS_VER = "4.10.38";
+const MXN = new Intl.NumberFormat("es-MX", { style: "currency", currency: "MXN" });
+
+let pdfjs = null;
+async function loadPdfJs() {
+  if (pdfjs) return pdfjs;
+  try {
+    const mod = await import(`https://cdn.jsdelivr.net/npm/pdfjs-dist@${PDFJS_VER}/build/pdf.min.mjs`);
+    mod.GlobalWorkerOptions.workerSrc =
+      `https://cdn.jsdelivr.net/npm/pdfjs-dist@${PDFJS_VER}/build/pdf.worker.min.mjs`;
+    pdfjs = mod;
+    return mod;
+  } catch (e) {
+    throw new Error("No se pudo cargar el lector de PDF (se necesita internet). Si sigue igual, exporta el estado de cuenta como Excel o CSV desde tu banca en linea.");
+  }
+}
+
+
+
+/* ------------------------- lectores (navegador) ------------------------- */
+
+async function pdfToPages(file) {
+  return readPdfPages(await loadPdfJs(), file);
 }
 
 function matrixFromWorkbook(wb) {
@@ -1139,6 +1391,8 @@ $("invert").addEventListener("change", (e) => {
   state.invert = e.target.checked;
   recompute();
 });
+
+window.__fiscalOk = true;
 </script>
 </body>
 </html>
